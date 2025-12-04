@@ -122,6 +122,7 @@ impl HttpServer {
         
         
         
+        
         Ok(())
     }
     
@@ -159,8 +160,11 @@ impl HttpServer {
                         // e.g. http://example.com/path -> /path
                         req.path = req.path.split('/').skip(3).collect::<Vec<&str>>().join("/");
                     }
-                    
+
+                    let connection_close = req.headers.has("connection") && req.headers.get("connection").unwrap().to_lowercase() == "close"; 
+
                     let mut tmp = callbacks.iter();
+                    let mut sent = false;
                     while let Some(listener) = tmp.next() {
                         if path_matches(&listener, &req.path) && method_matches(&listener, &req.method) {
                             let path_params = get_path_params(&listener, &req.path);
@@ -171,12 +175,23 @@ impl HttpServer {
                                 ..Default::default()
                             };
                             let res = (listener.callback)(req);
-                            return Self::send_response(&mut client, kept_request, res);
+                            Self::send_response(&mut client, kept_request, res);
+                            sent = true;
+                            break;
                         }
                     }
-                    
-                    let not_found_response = status(404);
-                    return Self::send_response(&mut client, req, not_found_response);
+
+                    if !sent {
+                        Self::send_simple_response(&mut client, status(404))?;
+                    }
+
+
+                    if connection_close {
+                        return Ok(())
+                    }
+
+
+           
                     
                 },
                 Ok(Err(res)) => Self::send_simple_response(&mut client, res)?,
