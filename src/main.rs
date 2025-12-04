@@ -78,7 +78,7 @@ fn main() -> std::io::Result<()> {
             let dir = format!("{}/{}", home_dir, path);
             match std::fs::write(dir, req.body) {
                 Ok(_) => {
-                    return status(200);
+                    return status(201);
                 },
                 Err(_) => {
                     return status(500);
