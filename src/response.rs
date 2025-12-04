@@ -1,4 +1,4 @@
-use crate::mime_type::TEXT_PLAIN;
+use crate::mime_type::{APPLICATION_OCTET_STREAM, TEXT_PLAIN};
 
 pub struct Response {
     pub content_type: String,
@@ -24,7 +24,7 @@ pub fn text<S: AsRef<str>>(text: S) -> Response {
 
 pub fn bytes(bytes: Vec<u8>) -> Response {
     return Response {
-        content_type: TEXT_PLAIN.to_string(),
+        content_type: APPLICATION_OCTET_STREAM.to_string(),
         bytes,
         status_code: 200,
     };
