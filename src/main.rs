@@ -1,26 +1,15 @@
-#![allow(unused)]
+use http_server::http_server::prelude::*;
 
-mod client_socket;
-mod http_method;
-mod http_server;
-mod request;
-mod response;
-mod server_socket;
-mod socket;
-mod utils;
-mod status_code;
-mod mime_type;
+use http_server::status_code::NOT_FOUND;
+use http_server::{response::{bytes, status, text}, status_code::OK};
 
 
-use http_server::HttpServer;
-
-use crate::{response::{bytes, status, text}, status_code::OK};
 
 fn main() -> std::io::Result<()> {
     let mut server = HttpServer::new();
     
     
-    let home_dir = if std::env::args().nth(1).unwrap_or("".into()) == "--directory" {
+    let home_dir = if std::env::args().nth(1).is_some_and(|c| c == "--directory") {
         std::env::args().nth(2).unwrap_or(".".into())
     } else {
         ".".into()
@@ -28,7 +17,7 @@ fn main() -> std::io::Result<()> {
     
     
     
-    server.get("/", |req| {
+    server.get("/", |_| {
         return text("Hello, World!");
     });
   
@@ -42,9 +31,12 @@ fn main() -> std::io::Result<()> {
     });
   
     server.get("/user-agent", |req| {
-        if req.headers.has("user-agent") {
-            let header_value = req.headers.get("user-agent").unwrap();
-            return text(header_value);
+        match req.headers.get_require_single("user-agent") {
+            Ok(Some(t)) => {
+                return text(t);
+            },
+            Ok(None) => {},
+            Err(_) => {},
         }
         return text("No User-Agent header found");
     });
@@ -62,7 +54,7 @@ fn main() -> std::io::Result<()> {
                     return bytes(content);
                 },
                 Err(_) => {
-                    return status(404);
+                    return status(NOT_FOUND);
                 }
             }
         });
@@ -99,5 +91,7 @@ fn main() -> std::io::Result<()> {
         
     });
     
-    server.run("0.0.0.0", "4221")
+    let (task, _wx) = server.run("0.0.0.0", "4221", Default::default());
+    
+    smol::block_on(task)
 }

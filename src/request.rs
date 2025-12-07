@@ -1,76 +1,60 @@
+mod test;
+
+use std::fmt::Display;
+
 use crate::{
-    client_socket::ClientSocket,
+    client_socket::{ReadError, Socket, SocketReader},
     http_method::{HttpMethod, parse_method},
-    response::{Response, status},
-    utils::bytes_contain,
+    http_server::HttpServerConfig,
+    http_version::{HttpVersion, parse_http_version},
+    map::{DuplicateMap, Map},
 };
 
-#[derive(Clone)]
-pub enum DuplicateMap {
-    Single(String),
-    List(Vec<String>),
+#[derive(Debug)]
+pub enum RequestParsingError {
+    UnhandledRequest,
+    InvalidRequest,
+    InvalidHeader,
+    InvalidBody,
+    PayloadTooLarge,
+    IoError(std::io::Error),
+    Timeout,
+    Cancellation,
+    UnexpectedError,
 }
 
-#[derive(Clone)]
-pub struct Map<T> {
-    params: Vec<(String, T)>,
-}
-
-impl<T> Map<T> {
-    pub fn has(&self, index: &str) -> bool {
-        return self.params.iter().any(|key| key.0 == index);
-    }
-
-    pub fn get(&self, index: &str) -> Option<&T> {
-        return self
-            .params
-            .iter()
-            .find(|x| x.0.as_str() == index)
-            .map(|value| &value.1);
-    }
-}
-
-impl Map<DuplicateMap> {
-    pub fn add(&mut self, key: &str, value: String) {
-        for entry in self.params.iter_mut() {
-            if &entry.0 == key {
-                match &mut entry.1 {
-                    DuplicateMap::Single(original_value) => {
-                        entry.1 = DuplicateMap::List(vec![original_value.clone(), value]);
-                        return;
-                    }
-                    DuplicateMap::List(items) => {
-                        items.push(value);
-                        return;
-                    }
-                }
-            }
+impl PartialEq for RequestParsingError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::IoError(l0), Self::IoError(r0)) => l0.kind() == r0.kind(),
+            _ => core::mem::discriminant(self) == core::mem::discriminant(other),
         }
-        self.params
-            .push((key.to_owned(), DuplicateMap::Single(value)))
     }
 }
 
-impl Map<String> {
-    pub fn add(&mut self, key: &str, value: String) {
-        self.params.push((key.to_owned(), value))
-    }
-}
-
-impl<T> Default for Map<T> {
-    fn default() -> Self {
-        Self {
-            params: Default::default(),
+impl Display for RequestParsingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestParsingError::UnhandledRequest => write!(f, "UnhandledRequest"),
+            RequestParsingError::InvalidRequest => write!(f, "InvalidRequest"),
+            RequestParsingError::InvalidHeader => write!(f, "InvalidHeader"),
+            RequestParsingError::InvalidBody => write!(f, "InvalidBody"),
+            RequestParsingError::PayloadTooLarge => write!(f, "PayloadTooLarge"),
+            RequestParsingError::IoError(e) => write!(f, "IoError: {}", e),
+            RequestParsingError::Timeout => write!(f, "Timeout"),
+            RequestParsingError::Cancellation => write!(f, "Cancellation"),
+            RequestParsingError::UnexpectedError => write!(f, "UnexpectedError"),
         }
     }
 }
 
 pub struct Request {
     pub method: HttpMethod,
+    pub http_version: HttpVersion,
     pub body: Vec<u8>,
     pub path: String,
     pub query_params: Map<DuplicateMap>,
-    pub headers: Map<String>,
+    pub headers: Map<DuplicateMap>,
     pub path_params: Map<String>,
 }
 
@@ -78,6 +62,7 @@ impl Default for Request {
     fn default() -> Self {
         Self {
             method: HttpMethod::GET,
+            http_version: HttpVersion::Http1_1,
             body: Default::default(),
             path: Default::default(),
             query_params: Default::default(),
@@ -120,162 +105,161 @@ fn is_tchar(c: char) -> bool {
         )
 }
 
-fn is_valid_header_name(name: &str) -> bool {
+pub(crate) fn is_valid_header_name(name: &str) -> bool {
     name.chars().all(|c| c.is_alphanumeric() || is_tchar(c))
 }
 
-fn is_valid_header_value(value: &str) -> bool {
+pub(crate) fn is_valid_header_value(value: &str) -> bool {
     value.bytes().all(|b| b == 9 || (b >= 32 && b != 127))
 }
 
-fn header_can_be_duplicate(name: &str) -> bool {
+pub(crate) fn header_can_be_duplicate(name: &str) -> bool {
     return DUPLICATABLE_HEADER_NAMES
         .iter()
         .any(|header_name| header_name == &name);
 }
 
-fn bad_request() -> std::io::Result<Result<Request, Response>> {
-    return Ok(Err(status(400)));
-}
 
-pub fn parse_request(
-    client: &mut ClientSocket,
-    request_headers: Vec<u8>,
-    extra_bytes: Vec<u8>,
-) -> std::io::Result<Result<Request, Response>> {
-    let headers_s = match String::from_utf8(request_headers) {
-        Ok(headers) => headers,
-        Err(err) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                err.to_string(),
-            ));
-        }
-    };
 
-    let (header_line, headers) = match headers_s.split_once("\r\n").ok_or_else(|| status(400)) {
-        Ok(v) => v,
-        Err(e) => return Ok(Err(e)),
-    };
-
-    let tokens = header_line.split(" ").collect::<Vec<_>>();
+pub(crate) fn parse_http_request_line(
+    line: &str,
+) -> Result<(HttpMethod, HttpVersion, String), RequestParsingError> {
+    let tokens = line.split(" ").collect::<Vec<_>>();
 
     if tokens.len() < 3 {
-        return bad_request();
+        return Err(RequestParsingError::UnhandledRequest);
     }
 
     let http_method = match parse_method(tokens[0]) {
         Some(method) => method,
-        None => return Ok(Err(status(400))),
+        None => return Err(RequestParsingError::UnhandledRequest),
     };
 
-    if tokens[2] != "HTTP/1.1" && tokens[2] != "HTTP/1.0" {
-        return Ok(Err(status(505)));
-    }
+    let http_version = parse_http_version(tokens[2]).ok_or_else(|| RequestParsingError::UnhandledRequest)?;
 
     let path = tokens[1];
 
+    return Ok((http_method, http_version, path.to_owned()));
+}
 
-    let mut header_map: Map<String> = Map::default();
-    for header in headers.split("\r\n") {
-        if header.is_empty() {
-            continue;
+pub(crate) fn parse_header_line(header: &str) -> Result<Option<(String, String)>, RequestParsingError> {
+    if header.is_empty() {
+        return Ok(None);
+    }
+
+    let (header_name, header_value) = match header.split_once(":") {
+        Some(value) => (value.0.trim_end(), value.1.trim_start()),
+        None => return Ok(None),
+    };
+
+    let header_name = header_name.to_lowercase();
+    if !is_valid_header_name(&header_name) || !is_valid_header_value(header_value) {
+        return Err(RequestParsingError::InvalidHeader);
+    }
+
+    return Ok(Some((header_name, header_value.to_owned())));
+}
+
+pub(crate) fn parse_headers<'a, T: Iterator<Item = &'a str>>(headers: T) -> Result<Map<DuplicateMap>, RequestParsingError> {
+    let mut header_map: Map<DuplicateMap> = Map::default();
+
+    for header in headers {
+        match parse_header_line(header)? {
+            Some((name, value)) => {
+                if header_can_be_duplicate(&name) {
+                    header_map.add(&name, value);
+                } else {
+                    match header_map.add_require_single(&name, value) {
+                        Ok(_) => {}
+                        Err(_) => return Err(RequestParsingError::InvalidHeader),
+                    }
+                }
+            }
+            None => {
+                if !header.is_empty() {
+                    return Err(RequestParsingError::InvalidHeader);
+                }
+            },
         }
+    }
 
-        let (header_name, header_value) = match header.split_once(":") {
-            Some(value) => (value.0.trim_end(), value.1.trim_start()),
-            None => continue,
-        };
+    Ok(header_map)
+}
 
-        let header_name = header_name.to_lowercase();
-        if !is_valid_header_name(&header_name) || !is_valid_header_value(header_value) {
-            return bad_request();
-        }
+pub(crate) async fn parse_chunked_body<T: SocketReader>(
+    client: &mut T,
+    extra_bytes: Vec<u8>,
+    config: HttpServerConfig,
+) -> Result<Vec<u8>, ReadError> {
+    let chunks = client.read_chunked(
+        extra_bytes,
+        b"\r\n",
+        b"\r\n",
+        config.size_config.request_body_max_size,
+    );
 
-        if header_map.has(&header_name) && !header_can_be_duplicate(&header_name) {
-            return bad_request();
-        }
+    chunks.await
+}
 
-        header_map.add(&header_name, header_value.to_owned());
+pub(crate) async fn parse_body_from_content_length<T: SocketReader>(
+    client: &mut T,
+    content_length: usize,
+    extra_bytes: Vec<u8>,
+    config: HttpServerConfig,
+) -> Result<Vec<u8>, ReadError> {
+    let mut body = vec![];
+    let already_received = extra_bytes.len();
+    body.extend(extra_bytes);
+    
+    if content_length > config.size_config.request_body_max_size {
+        return Err(ReadError::MaxSizeExceeded);
     }
     
-    for key in header_map.params.iter().map(|(k, _)| k) {
-        println!("Header length {}", key.len());
+    if already_received < content_length {
+        body.extend(client.read_n(content_length - already_received).await?);
     }
 
-    if tokens[2] == "HTTP/1.1" && !header_map.has("host") {
-        return bad_request();
-    }
+    return Ok(body);
+}
 
-    if header_map.has("content-length") && header_map.has("transfer-encoding") {
-        return bad_request();
-    }
-
-    let mut body = vec![];
-    if header_map.has("content-length") {
-        let content_length = match header_map.get("content-length") {
-            Some(content_length) => content_length,
-            None => return bad_request(),
-        };
-
+pub(crate) async fn parse_body<T: SocketReader>(
+    client: &mut T,
+    header_map: &Map<DuplicateMap>,
+    extra_bytes: Vec<u8>,
+    config: HttpServerConfig,
+) -> Result<Vec<u8>, RequestParsingError> {
+    let body = if let Ok(Some(content_length)) = header_map.get_require_single("content-length") {
         /* DATA: In theory if we received more bytes than usize::max this would be an issue. */
         let content_length = match usize::from_str_radix(content_length, 10) {
             Ok(value) => value,
-            Err(_) => return bad_request(),
+            Err(_) => return Err(RequestParsingError::InvalidHeader),
         };
 
-        let already_received = extra_bytes.len();
-        body.extend(extra_bytes);
-        if already_received < content_length {
-            body.extend(client.read_n(content_length - already_received)?);
+        if content_length > config.size_config.request_body_max_size {
+            return Err(RequestParsingError::PayloadTooLarge);
         }
-    } else if header_map.has("transfer-encoding") {
-        let transfer_encoding = match header_map.get("transfer-encoding") {
-            Some(transfer_encoding) => transfer_encoding,
-            None => return bad_request(),
-        };
 
+        parse_body_from_content_length(client, content_length, extra_bytes, config).await
+    } else if let Ok(Some(transfer_encoding)) = header_map.get_require_single("transfer-encoding") {
         if transfer_encoding != "chunked" {
-            return bad_request();
+            return Err(RequestParsingError::InvalidHeader);
         }
 
-        let mut buffer = extra_bytes;
-        if !bytes_contain(&buffer, "\r\n0\r\n".as_bytes()) {
-            let (read, _) = client.read_until("\r\n0\r\n".as_bytes())?;
-            buffer.extend(read);
-        }
-
-        let mut index = 0;
-        loop {
-            // from this point onwards, we have all the data to be read in buffer and we don't need to read with the client anymore
-
-            let line_end = match buffer[index..].windows(2).position(|w| w == b"\r\n") {
-                Some(pos) => pos + index,
-                None => return bad_request(),
-            };
-
-            let chunk_size_s = match String::from_utf8(buffer[index..line_end].to_vec()) {
-                Ok(s) => s,
-                Err(_) => return bad_request(),
-            };
-
-            let chunk_size = match usize::from_str_radix(chunk_size_s.trim(), 16) {
-                Ok(size) => size,
-                Err(_) => return bad_request(),
-            };
-
-            index = line_end + 2;
-            if chunk_size == 0 {
-                break;
-            }
-            if buffer.len() < index + chunk_size + 2 {
-                return bad_request();
-            }
-            body.extend(&buffer[index..index + chunk_size]);
-            index += chunk_size + 2; // skip \r\n            
-        }
+        parse_chunked_body(client, extra_bytes, config).await
+    } else {
+        Ok(vec![])
+    };
+    match body {
+        Ok(v) => Ok(v),
+        Err(ReadError::MaxSizeExceeded) => Err(RequestParsingError::PayloadTooLarge),
+        Err(ReadError::IoError(e)) => Err(RequestParsingError::IoError(e)),
+        Err(ReadError::Timeout) => Err(RequestParsingError::Timeout),
+        Err(ReadError::Cancellation) => Err(RequestParsingError::Cancellation),
+        Err(ReadError::UnexpectedError) => Err(RequestParsingError::InvalidBody),
     }
+}
 
+pub(crate) fn parse_query_params(path: &str) -> Map<DuplicateMap> {
     let mut query_params: Map<DuplicateMap> = Map::default();
     let query_start = match path.find("?") {
         Some(pos) => pos,
@@ -293,12 +277,63 @@ pub fn parse_request(
         }
     }
 
-    Ok(Ok(Request {
-        path: path.to_owned(),
+    return query_params;
+}
+
+pub(crate) async fn parse_request<T: Socket>(
+    client: &mut T,
+    request_headers: Vec<u8>,
+    extra_bytes: Vec<u8>,
+    config: HttpServerConfig,
+) -> Result<Request, RequestParsingError> {
+    let headers_s = match String::from_utf8(request_headers) {
+        Ok(headers) => headers,
+        Err(_) => {
+            return Err(RequestParsingError::InvalidRequest);
+        }
+    };
+
+    let (header_line, headers) = match headers_s.split_once("\r\n") {
+        Some(v) => v,
+        None => return Err(RequestParsingError::InvalidRequest),
+    };
+
+    let (http_method, http_version, path) = parse_http_request_line(header_line)?;
+
+    let header_map = parse_headers(headers.split("\r\n"))?;
+
+    if matches!(http_version, HttpVersion::Http1_1) && !header_map.has("host") {
+        return Err(RequestParsingError::InvalidRequest);
+    }
+
+    if header_map.has("content-length") && header_map.has("transfer-encoding") {
+        return Err(RequestParsingError::InvalidRequest);
+    }
+
+    // Check for Expect: 100-continue header
+    let needs_continue = header_map
+        .get_single("expect")
+        .is_some_and(|e| e.to_lowercase().contains("100-continue"));
+
+    // If Expect: 100-continue is present, send 100 Continue response before reading body
+    if needs_continue {
+        let continue_response = b"HTTP/1.1 100 Continue\r\n\r\n";
+        if let Err(e) = client.write_all(continue_response).await {
+            return Err(RequestParsingError::IoError(e.into()));
+        }
+    }
+
+    let body = parse_body(client, &header_map, extra_bytes, config).await?;
+
+    let query_params = parse_query_params(&path);
+
+    Ok(Request {
+        path: path,
+        http_version: http_version,
         method: http_method,
         body: body,
         headers: header_map,
         query_params: query_params,
         ..Default::default()
-    }))
+    })
 }
